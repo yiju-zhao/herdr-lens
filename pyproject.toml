@@ -1,0 +1,13 @@
+[project]
+name = "herdr-lens"
+version = "0.1.0"
+description = "Read-only file previews beside native agent terminals"
+requires-python = ">=3.11"
+dependencies = ["textual==6.3.0"]
+
+[dependency-groups]
+dev = ["pytest==8.4.2", "pytest-asyncio==1.2.0", "pyte==0.8.2"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,18 @@
+{
+  "repository": "yiju-zhao/herdr-lens",
+  "tag": "v0.1.0",
+  "platforms": {
+    "darwin-aarch64": {
+      "viewer": {
+        "filename": "herdr-file-viewer-lens",
+        "asset": "herdr-file-viewer-lens-macos-aarch64",
+        "sha256": "f66bf98736ea7387c2a4faa5102a4bfba4c8bd42fe0c581085fd279d09987b69"
+      },
+      "client": {
+        "filename": "herdr-lens-client",
+        "asset": "herdr-lens-client-macos-aarch64",
+        "sha256": "191a7d8b8ec9e052569d87485a9171dd07856e93d727aff5e0ea6021e46ced74"
+      }
+    }
+  }
+}

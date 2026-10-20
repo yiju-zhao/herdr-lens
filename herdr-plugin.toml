@@ -1,0 +1,38 @@
+id = "eason.lens"
+name = "Herdr Lens"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Preview file paths from Claude Code, Codex, and other terminals."
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "scripts/bootstrap.sh"]
+
+[[actions]]
+id = "open"
+title = "Lens: preview selected path / enter a path"
+contexts = ["pane", "selection"]
+command = ["sh", "run.sh", "open"]
+
+[[actions]]
+id = "setup-clicks"
+title = "Lens: enable bare-path Ctrl+click (Herdr 0.9.3)"
+command = ["sh", "run.sh", "setup-clicks"]
+
+[[link_handlers]]
+id = "file"
+title = "Lens: preview file"
+pattern = "^(file://|lens:)"
+action = "open"
+
+[[panes]]
+id = "viewer"
+title = "Lens · File preview"
+placement = "split"
+command = ["sh", "run.sh", "view"]
+
+[[panes]]
+id = "files"
+title = "Files · Markdown preview"
+placement = "split"
+command = ["sh", "run.sh", "files"]

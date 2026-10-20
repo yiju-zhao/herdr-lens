@@ -1,0 +1,13 @@
+.venv/
+.toolchain/
+vendor/
+build/
+__pycache__/
+.pytest_cache/
+.test-state/
+*.pyc
+build-rust.log
+dist/
+.DS_Store
+# Local research and deployment notes are not part of the public package.
+docs/*-2026-10-20.md

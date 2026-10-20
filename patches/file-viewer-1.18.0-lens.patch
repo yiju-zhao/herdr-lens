@@ -1,0 +1,487 @@
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index 12f18b7..4b3d99a 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -25,6 +25,7 @@ is unit-testable with stubs.
+ 
+ | Module | Responsibility |
+ | --- | --- |
++| `open_request` | Opt-in, bounded read-only request-file channel for a dedicated viewer. Deduplicates IDs, retains the newest request during a modal, and stays bound to the startup root; the existing open-target controller seam performs navigation. |
+ | `host` | The herdr boundary: parse the injected `HERDR_PLUGIN_CONTEXT_JSON` launch context, degrading to `{ cwd }` on anything malformed (never panics), then layer an explicit `HERDR_FILE_VIEWER_ROOT` (absolute, existing directory; set by the root picker or an agent) over the invoking pane's cwd. |
+ | `context` | The normalized `LaunchContext` the host hands to the resolver. |
+ | `root` | Resolve the tree root (git worktree top-level, else cwd) and git-presence; the re-root engine re-resolves the root and rebuilds the tree + git services in place when you switch worktrees. |
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a321b2b..09aaed2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format is based on
+ 
+ ## [Unreleased]
+ 
++### Added
++- Local integration: external file-open requests reuse a dedicated preview, preserve within-project annotations, and wait during modals. → [external requests](docs/external-open.md)
++
+ ## [1.18.0] - 2026-10-08
+ 
+ ### Added
+diff --git a/Cargo.lock b/Cargo.lock
+index c53bd26..112813b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -574,7 +574,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+ 
+ [[package]]
+ name = "herdr-file-viewer"
+-version = "1.18.0"
++version = "1.19.0-lens.1"
+ dependencies = [
+  "ansi-to-tui",
+  "crossterm",
+diff --git a/Cargo.toml b/Cargo.toml
+index a687d4f..1fa9452 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "herdr-file-viewer"
+-version = "1.18.0"
++version = "1.19.0-lens.1"
+ edition = "2024"
+ rust-version = "1.96"
+ description = "A git-aware, read-only file viewer that runs as a herdr TUI pane"
+diff --git a/docs/usage.md b/docs/usage.md
+index 1d9ba91..3c6fb97 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -1,5 +1,8 @@
+ # Usage guide
+ 
++Host integrations may opt a dedicated Files pane into [external file-open requests](external-open.md),
++so another clicked agent-output path changes the displayed file without another pane.
++
+ This guide explains each viewer feature. See the [keys reference](keys.md) for exact keys and mouse
+ gestures, [summoning](summoning.md) to open the viewer, and [configuration](configuration.md) to
+ customize it.
+diff --git a/herdr-plugin.toml b/herdr-plugin.toml
+index ed73a70..01c3614 100644
+--- a/herdr-plugin.toml
++++ b/herdr-plugin.toml
+@@ -24,7 +24,7 @@
+ 
+ id = "herdr-file-viewer"
+ name = "herdr-file-viewer"
+-version = "1.18.0"
++version = "1.19.0-lens.1"
+ description = "A git-aware, read-only file viewer: a keyboard-driven TUI in a herdr split pane."
+ min_herdr_version = "0.7.5"
+ platforms = ["linux", "macos", "windows"]
+diff --git a/src/app.rs b/src/app.rs
+index 2a9d87a..c43040d 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -311,8 +311,20 @@ fn draw_if_needed<B: Backend>(
+ /// a startup resize whose notification arrived before input polling was initialized.
+ fn event_loop(terminal: &mut DefaultTerminal, controller: &mut Controller) -> io::Result<()> {
+     let mut dirty = true; // paint the first frame
++    let mut external = crate::open_request::OpenRequests::from_env(controller.root());
++    let mut next_external_poll = Instant::now();
+     let mut cwd_root = PathBuf::new();
+     loop {
++        if let Some(requests) = external.as_mut()
++            && Instant::now() >= next_external_poll
++        {
++            next_external_poll = Instant::now() + crate::open_request::POLL_INTERVAL;
++            if let Some(target) = requests.poll(controller.root(), controller.external_open_ready())
++            {
++                controller.apply_preview_request(&target);
++                dirty = true;
++            }
++        }
+         follow_root(controller.root(), &mut cwd_root);
+         draw_if_needed(terminal, controller, &mut dirty)?;
+ 
+diff --git a/src/controller/mod.rs b/src/controller/mod.rs
+index 53ae8f5..089bc99 100644
+--- a/src/controller/mod.rs
++++ b/src/controller/mod.rs
+@@ -1814,7 +1814,29 @@ impl Controller {
+         }
+     }
+ 
+-    /// Apply a launch **open target** once at startup: resolve `path` under the tree **root**,
++    /// Modals keep their input; within-root navigation preserves annotations and pins.
++    pub fn external_open_ready(&self) -> bool {
++        matches!(self.modal, Modal::None)
++    }
++
++    /// A host click asks to read the file, so dedicate this pane to its content.
++    /// The normal Files browser remains unchanged; `z` can reveal the tree here.
++    pub fn apply_preview_request(&mut self, target: &crate::open_target::OpenTarget) {
++        if !self.external_open_ready() {
++            return;
++        }
++        let expected = crate::open_target::resolve_under_root(&self.root, &target.path);
++        self.apply_open_target(target);
++        if self.tree.selected().is_some_and(|node| {
++            node.kind == NodeKind::File && Some(&node.path) == expected.as_ref()
++        }) {
++            self.zoomed = true;
++            self.focus = Focus::Content;
++            self.pending_open_zoom = false;
++        }
++    }
++
++    /// Apply an **open target**: resolve `path` under the tree **root**,
+     /// **reveal in tree**, dispatch a render, and (when a line is set) queue a **go to line** via
+     /// [`pending_goto`](Self::pending_goto) after forcing the source-mapped view when needed.
+     ///
+diff --git a/src/lib.rs b/src/lib.rs
+index 934598a..18ada88 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,6 +22,7 @@ pub mod infile;
+ pub mod input;
+ pub mod intent;
+ pub mod launch;
++pub mod open_request;
+ pub mod open_target;
+ pub mod opener;
+ pub mod picker;
+diff --git a/src/open_target.rs b/src/open_target.rs
+index 3228dae..d5d814d 100644
+--- a/src/open_target.rs
++++ b/src/open_target.rs
+@@ -3,8 +3,8 @@
+ //!
+ //! Accepts the same shape **line reference** copies (`L`): repo-relative path, optionally with a
+ //! 1-based line or `start-end` range (range → jump to the start line; a success notice echoes the
+-//! full reference). Used once at startup from `--open` / `HERDR_FILE_VIEWER_OPEN`; not a sticky
+-//! config setting.
++//! full reference). Used at startup from `--open` / `HERDR_FILE_VIEWER_OPEN` and by
++//! the opt-in external request channel; not a sticky config setting.
+ 
+ use std::path::{Component, Path, PathBuf};
+ 
+diff --git a/src/update/version.rs b/src/update/version.rs
+index 30629d1..db8ece1 100644
+--- a/src/update/version.rs
++++ b/src/update/version.rs
+@@ -40,14 +40,14 @@ impl std::fmt::Display for Version {
+ 
+ /// The version compiled into this binary (Cargo's package version).
+ pub fn current() -> Version {
+-    // The package version is always a valid triple (CI/clippy would reject otherwise), so this
+-    // parse cannot fail in a real build; fall back to 0.0.0 rather than panic, keeping the
+-    // "never crash" invariant even for a hand-mangled version string.
+-    Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version {
+-        major: 0,
+-        minor: 0,
+-        patch: 0,
+-    })
++    // Cargo exposes numeric components separately, including for local prerelease
++    // builds. Keep rejecting prerelease release tags in `parse`, but do not
++    // misidentify the running development binary as version 0.0.0.
++    Version {
++        major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0),
++        minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
++        patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
++    }
+ }
+ 
+ /// `Some(latest)` iff `latest` is strictly newer than the running build, else `None`.
+@@ -57,6 +57,11 @@ pub fn newer_than_current(latest: Version) -> Option<Version> {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn current_build_keeps_its_numeric_version_with_a_prerelease_suffix() {
++        let numeric = env!("CARGO_PKG_VERSION").split(['-', '+']).next().unwrap();
++        assert_eq!(super::current(), super::Version::parse(numeric).unwrap());
++    }
+     use super::*;
+ 
+     #[test]
+diff --git a/tests/annotations.rs b/tests/annotations.rs
+index 93857c6..d9f2bc9 100644
+--- a/tests/annotations.rs
++++ b/tests/annotations.rs
+@@ -209,6 +209,40 @@ fn mouse(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+     }
+ }
+ 
++#[test]
++fn external_navigation_defers_an_unsaved_note_and_preserves_it_on_its_original_file() {
++    let dir = TempDir::new();
++    std::fs::write(dir.path().join("a.md"), "first").unwrap();
++    std::fs::write(dir.path().join("b.md"), "second").unwrap();
++    let (mut ctrl, _) = controller(dir.path(), false);
++    ctrl.apply_open_target(&herdr_file_viewer::open_target::parse_open_target("a.md").unwrap());
++    ctrl.handle(Intent::AddAnnotation);
++    type_editor(&mut ctrl, "Keep this note on a.md");
++    let path = dir.path().join("request.json");
++    std::fs::write(&path, r#"{"id":"next","target":"b.md"}"#).unwrap();
++    let mut requests =
++        herdr_file_viewer::open_request::OpenRequests::new(path, dir.path().to_path_buf()).unwrap();
++    assert!(
++        requests
++            .poll(ctrl.root(), ctrl.external_open_ready())
++            .is_none()
++    );
++    assert!(ctrl.annotation_editor().is_some());
++    save_editor(&mut ctrl);
++    let request = requests
++        .poll(ctrl.root(), ctrl.external_open_ready())
++        .unwrap();
++    ctrl.apply_preview_request(&request);
++    assert_eq!(
++        ctrl.tree().selected().unwrap().path,
++        dir.path().join("b.md")
++    );
++    let saved = ctrl.annotations().ordered();
++    assert_eq!(saved.len(), 1);
++    assert_eq!(saved[0].target().path(), Path::new("a.md"));
++    assert_eq!(saved[0].text(), "Keep this note on a.md");
++}
++
+ #[test]
+ fn indicator_projection_is_root_joined_deduplicated_merged_and_immediate() {
+     let dir = TempDir::new();
+diff --git a/tests/controller.rs b/tests/controller.rs
+index fdcf30c..8bee206 100644
+--- a/tests/controller.rs
++++ b/tests/controller.rs
+@@ -176,6 +176,32 @@ fn visible_names(ctrl: &Controller) -> Vec<String> {
+ 
+ // ---- tests ----------------------------------------------------------------------------
+ 
++#[test]
++fn external_open_waits_for_modal_without_discarding_its_input() {
++    let dir = TempDir::new();
++    std::fs::write(dir.path().join("first.md"), "first").unwrap();
++    std::fs::write(dir.path().join("second.md"), "second").unwrap();
++    let (mut ctrl, _, _) = controller(dir.path(), false, StubGit::default(), false);
++    assert!(ctrl.external_open_ready());
++    ctrl.handle(Intent::ShowHelp);
++    assert!(!ctrl.external_open_ready());
++    ctrl.handle_help_key(crossterm::event::KeyEvent::new(
++        crossterm::event::KeyCode::Esc,
++        KeyModifiers::NONE,
++    ));
++    assert!(ctrl.external_open_ready());
++    let target = herdr_file_viewer::open_target::parse_open_target("second.md").unwrap();
++    ctrl.apply_preview_request(&target);
++    assert_eq!(
++        ctrl.tree().selected().unwrap().path,
++        dir.path().join("second.md")
++    );
++    assert!(
++        ctrl.zoomed(),
++        "a click preview must show content even in a narrow split"
++    );
++}
++
+ #[test]
+ fn toggle_ignore_flips_show_ignored_and_signals_redraw() {
+     // AC-5: revealing/hiding ignored files is a controller toggle that redraws.
+diff --git a/src/open_request.rs b/src/open_request.rs
+new file mode 100644
+index 0000000..1ffe5fc
+--- /dev/null
++++ b/src/open_request.rs
+@@ -0,0 +1,158 @@
++//! Opt-in, read-only requests to navigate a dedicated viewer within its startup root.
++use crate::open_target::{OpenTarget, parse_open_target_preferring_file, resolve_under_root};
++use serde::Deserialize;
++use std::fs::File;
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++
++pub const REQUEST_ENV: &str = "HERDR_FILE_VIEWER_REQUEST_FILE";
++pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
++const MAX_BYTES: u64 = 16 * 1024;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Request {
++    id: String,
++    target: String,
++}
++
++pub struct OpenRequests {
++    path: PathBuf,
++    root: PathBuf,
++    seen: Option<String>,
++    pending: Option<OpenTarget>,
++}
++
++impl OpenRequests {
++    pub fn new(path: PathBuf, root: PathBuf) -> Option<Self> {
++        path.is_absolute().then_some(Self {
++            path,
++            root,
++            seen: None,
++            pending: None,
++        })
++    }
++
++    pub fn from_env(root: &Path) -> Option<Self> {
++        Self::new(std::env::var_os(REQUEST_ENV)?.into(), root.to_path_buf())
++    }
++
++    fn read(&self) -> Option<Request> {
++        // Inspect before opening so a named pipe cannot block the event loop.
++        if !std::fs::metadata(&self.path).ok()?.is_file() {
++            return None;
++        }
++        let file = File::open(&self.path).ok()?;
++        if !file.metadata().ok()?.is_file() {
++            return None;
++        }
++        let mut bytes = Vec::new();
++        file.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
++        if bytes.len() as u64 > MAX_BYTES {
++            return None;
++        }
++        let request: Request = serde_json::from_slice(&bytes).ok()?;
++        if request.id.is_empty()
++            || request.id.len() > 128
++            || request.target.is_empty()
++            || request.target.chars().any(char::is_control)
++        {
++            return None;
++        }
++        Some(request)
++    }
++
++    /// Modals retain input ownership. A root switch suspends the channel.
++    pub fn poll(&mut self, current_root: &Path, ready: bool) -> Option<OpenTarget> {
++        if current_root != self.root {
++            return None;
++        }
++        if let Some(request) = self.read()
++            && self.seen.as_deref() != Some(request.id.as_str())
++        {
++            self.seen = Some(request.id);
++            self.pending = parse_open_target_preferring_file(&request.target, |raw| {
++                resolve_under_root(current_root, raw).is_some_and(|p| p.is_file())
++            })
++            .filter(|target| resolve_under_root(current_root, &target.path).is_some());
++        }
++        if ready { self.pending.take() } else { None }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static NEXT: AtomicU64 = AtomicU64::new(0);
++    struct Fixture(PathBuf);
++    impl Fixture {
++        fn new() -> Self {
++            let root = std::env::temp_dir().join(format!(
++                "fv-open-request-{}-{}",
++                std::process::id(),
++                NEXT.fetch_add(1, Ordering::Relaxed)
++            ));
++            std::fs::create_dir_all(&root).unwrap();
++            Self(root)
++        }
++        fn write(&self, id: &str, target: &str) {
++            std::fs::write(
++                self.0.join("request.json"),
++                serde_json::to_vec(&serde_json::json!({"id":id,"target":target})).unwrap(),
++            )
++            .unwrap();
++        }
++        fn reader(&self) -> OpenRequests {
++            OpenRequests::new(self.0.join("request.json"), self.0.clone()).unwrap()
++        }
++    }
++    impl Drop for Fixture {
++        fn drop(&mut self) {
++            let _ = std::fs::remove_dir_all(&self.0);
++        }
++    }
++
++    #[test]
++    fn deduplicates_and_keeps_latest_request_while_modal_is_open() {
++        let f = Fixture::new();
++        let mut reader = f.reader();
++        f.write("1", "first.md");
++        assert!(reader.poll(&f.0, false).is_none());
++        f.write("2", "中文 空格.md:8");
++        assert!(reader.poll(&f.0, false).is_none());
++        let target = reader.poll(&f.0, true).unwrap();
++        assert_eq!(target.path, "中文 空格.md");
++        assert_eq!(target.line, Some(8));
++        assert!(reader.poll(&f.0, true).is_none());
++    }
++
++    #[test]
++    fn malformed_oversized_and_out_of_root_requests_do_not_navigate() {
++        let f = Fixture::new();
++        let mut reader = f.reader();
++        std::fs::write(f.0.join("request.json"), b"{partial").unwrap();
++        assert!(reader.poll(&f.0, true).is_none());
++        f.write("1", "../outside.md");
++        assert!(reader.poll(&f.0, true).is_none());
++        f.write("2", &"x".repeat(MAX_BYTES as usize));
++        assert!(reader.poll(&f.0, true).is_none());
++        f.write("3", "normal.md");
++        assert!(reader.poll(&f.0.join("other-root"), true).is_none());
++        assert_eq!(reader.poll(&f.0, true).unwrap().path, "normal.md");
++    }
++
++    #[test]
++    fn supports_absolute_paths_and_literal_colon_filenames() {
++        let f = Fixture::new();
++        let path = f.0.join("notes:12");
++        std::fs::write(&path, "literal").unwrap();
++        let mut reader = f.reader();
++        f.write("1", path.to_str().unwrap());
++        let target = reader.poll(&f.0, true).unwrap();
++        assert_eq!(target.path, path.to_str().unwrap());
++        assert_eq!(target.line, None);
++    }
++}
+diff --git a/docs/external-open.md b/docs/external-open.md
+new file mode 100644
+index 0000000..ace66a6
+--- /dev/null
++++ b/docs/external-open.md
+@@ -0,0 +1,32 @@
++# Follow external file-open requests
++
++This local extension lets a host reuse a dedicated Files pane when a user clicks
++another path in an agent terminal. The host resolves relative paths using the
++source terminal's directory before handing them to the viewer.
++
++## Contract
++
++- Opt in with `HERDR_FILE_VIEWER_REQUEST_FILE=/absolute/path/request.json`.
++- Atomically replace that file with `{"id":"unique-request-id","target":"docs/plan.md"}`.
++  `target` accepts the same file/line/range grammar as `--open`.
++- The viewer only reads the request file. It does not create a service, execute
++  commands from requests, or write the viewed files.
++- Requests are bound to the startup tree root. Out-of-root paths remain rejected
++  by the existing open-target resolver. A host uses a different dedicated viewer
++  for a different root.
++- Only a new ID changes the selection. While a modal is open, the newest request
++  waits; closing the modal applies it without discarding the input.
++- Within-root navigation preserves annotations and pins. Manually opened Files
++  panes without the request-file variable are unaffected.
++- An accepted request shows the file content across the preview pane, including
++  narrow splits. Press `z` to reveal the file tree when desired.
++- Reads are bounded to 16 KiB and polled every 250 ms. Missing, oversized,
++  malformed and non-regular files leave the current preview intact.
++
++## Readiness and verification
++
++The feature uses the existing `apply_open_target` seam and renderer worker.
++Tests cover root ownership, modal ownership and deduplication. Host integration
++is verified with actual Ctrl-click input, absolute/relative Markdown paths,
++Unicode, spaces, wrapped paths, repeated-open process identity and the source
++terminal remaining alive.

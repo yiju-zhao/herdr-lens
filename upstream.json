@@ -1,0 +1,20 @@
+{
+  "viewer": {
+    "repository": "https://github.com/smarzban/herdr-file-viewer.git",
+    "commit": "4c2add6d952e81abc9ba4bbb9ff90107a626098c",
+    "version": "v1.18.0",
+    "patch": "patches/file-viewer-1.18.0-lens.patch",
+    "binary": "herdr-file-viewer",
+    "output": "herdr-file-viewer-lens",
+    "license": "MIT"
+  },
+  "client": {
+    "repository": "https://github.com/herdrdev/herdr.git",
+    "commit": "7b116c05bfda646af39d2524c54e70c751f57ee8",
+    "version": "v0.9.3",
+    "patch": "patches/herdr-0.9.3-lens.patch",
+    "binary": "herdr",
+    "output": "herdr-lens-client",
+    "license": "Apache-2.0"
+  }
+}

@@ -1,0 +1,709 @@
+diff --git a/src/client/shell.rs b/src/client/shell.rs
+index 2d18044..7fcea85 100644
+--- a/src/client/shell.rs
++++ b/src/client/shell.rs
+@@ -21,6 +21,7 @@ mod global_menu;
+ mod graphics;
+ mod input;
+ mod input_source;
++mod lens;
+ mod link_hover;
+ mod mobile;
+ mod mouse;
+diff --git a/src/client/shell/actions.rs b/src/client/shell/actions.rs
+index 9d0a3bd..053f297 100644
+--- a/src/client/shell/actions.rs
++++ b/src/client/shell/actions.rs
+@@ -655,10 +655,29 @@ impl ClientShellState {
+             } => {
+                 return self.complete_word_selection_row(pane_id, absolute_row, generation, result);
+             }
++            PendingEndpointKind::LensPrefix { click } => {
++                tracing::debug!(error = ?result.as_ref().err().and_then(|e| e.code.as_deref()), "Lens prefix completion");
++                return match result {
++                    Ok(crate::api::schema::ResponseResult::PaneSelection { text, .. }) => {
++                        (false, self.complete_lens_prefix(click, text))
++                    }
++                    _ => (false, Vec::new()),
++                };
++            }
++            PendingEndpointKind::LensSuffix { click, prefix } => {
++                tracing::debug!(error = ?result.as_ref().err().and_then(|e| e.code.as_deref()), "Lens suffix completion");
++                return match result {
++                    Ok(crate::api::schema::ResponseResult::PaneSelection { text, .. }) => {
++                        (false, self.complete_lens_suffix(click, prefix, text))
++                    }
++                    _ => (false, Vec::new()),
++                };
++            }
+             PendingEndpointKind::PaneLinkActivate {
+                 pane_id,
+                 inner_rect,
+                 fallback_events,
++                lens,
+             } => {
+                 let completed_before_release = !fallback_events.iter().any(|event| {
+                     event.kind
+@@ -696,6 +715,16 @@ impl ClientShellState {
+                         self.url_click_consumes_until_up = completed_before_release;
+                         (false, vec![ClientShellAction::OpenSafeWebUrl(url)])
+                     }
++                    Ok(crate::api::schema::ResponseResult::PaneLinkActivated {
++                        url: None, ..
++                    }) if lens.is_some() => {
++                        self.url_click_consumes_until_up = completed_before_release;
++                        (
++                            false,
++                            lens.map(|click| self.request_lens_prefix(click))
++                                .unwrap_or_default(),
++                        )
++                    }
+                     Ok(crate::api::schema::ResponseResult::PaneLinkActivated { .. }) => {
+                         (false, replay_action(replay))
+                     }
+diff --git a/src/client/shell/mouse.rs b/src/client/shell/mouse.rs
+index f2df294..7bfbb1d 100644
+--- a/src/client/shell/mouse.rs
++++ b/src/client/shell/mouse.rs
+@@ -945,6 +945,7 @@ impl ClientShellState {
+                     .map(|pane| pane.content_revision);
+                 self.last_pane_click = None;
+                 let pane_id = hit.pane_id.clone();
++                let lens = self.capture_lens_click(&hit, viewport_row, col);
+                 self.push_endpoint_method_with_kind(
+                     crate::api::schema::Method::PaneLinkActivate(
+                         crate::api::schema::PaneLinkActivateParams {
+@@ -958,6 +959,7 @@ impl ClientShellState {
+                         },
+                     ),
+                     PendingEndpointKind::PaneLinkActivate {
++                        lens,
+                         pane_id,
+                         inner_rect: hit.inner_rect,
+                         fallback_events: vec![mouse],
+diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
+index c170c9b..fe00918 100644
+--- a/src/client/shell/state.rs
++++ b/src/client/shell/state.rs
+@@ -656,6 +656,14 @@ pub(super) enum PendingEndpointKind {
+         pane_id: String,
+         inner_rect: Rect,
+         fallback_events: Vec<crossterm::event::MouseEvent>,
++        lens: Option<Box<super::lens::LensClick>>,
++    },
++    LensPrefix {
++        click: Box<super::lens::LensClick>,
++    },
++    LensSuffix {
++        click: Box<super::lens::LensClick>,
++        prefix: String,
+     },
+     CopyMotion {
+         pane_id: String,
+@@ -894,6 +902,8 @@ pub(crate) struct ClientShellState {
+     pub(super) previous_pane_id: Option<String>,
+     pub(super) pane_mouse_gesture: Option<ClientPaneMouseGesture>,
+     pub(super) link_hover: Option<super::link_hover::LinkHover>,
++    pub(super) lens_enabled: bool,
++    pub(super) lens_generation: u64,
+     pub(super) url_click_consumes_until_up: bool,
+     pub(super) replaying_url_click: bool,
+     pub(super) selection: Option<crate::selection::Selection<String>>,
+@@ -1059,6 +1069,8 @@ impl ClientShellState {
+             previous_pane_id: None,
+             pane_mouse_gesture: None,
+             link_hover: None,
++            lens_enabled: std::env::var_os("HERDR_LENS").is_some_and(|value| value == "1"),
++            lens_generation: 0,
+             url_click_consumes_until_up: false,
+             replaying_url_click: false,
+             selection: None,
+diff --git a/src/client/shell/tests/endpoint_requests.rs b/src/client/shell/tests/endpoint_requests.rs
+index 1f51f06..a4e9f24 100644
+--- a/src/client/shell/tests/endpoint_requests.rs
++++ b/src/client/shell/tests/endpoint_requests.rs
+@@ -451,6 +451,7 @@ fn cancelled_link_activation_does_not_replay_mouse_input() {
+             offset_from_bottom: None,
+         }),
+         PendingEndpointKind::PaneLinkActivate {
++            lens: None,
+             pane_id,
+             inner_rect,
+             fallback_events: vec![MouseEvent {
+diff --git a/src/client/shell/tests/mod.rs b/src/client/shell/tests/mod.rs
+index 9d96014..7b94d2d 100644
+--- a/src/client/shell/tests/mod.rs
++++ b/src/client/shell/tests/mod.rs
+@@ -88,7 +88,7 @@ fn worktree_list_result(open_workspace_id: Option<&str>) -> crate::api::schema::
+     }
+ }
+ 
+-fn surface() -> PaneSurfaceFrame {
++pub(super) fn surface() -> PaneSurfaceFrame {
+     let surface_buffer = Buffer::with_lines(["LIVE", "PANE"]);
+     PaneSurfaceFrame {
+         boot_id: "boot-1".into(),
+diff --git a/src/client/shell/worktrees.rs b/src/client/shell/worktrees.rs
+index 56c554c..432a718 100644
+--- a/src/client/shell/worktrees.rs
++++ b/src/client/shell/worktrees.rs
+@@ -537,6 +537,8 @@ impl ClientShellState {
+                 | PendingEndpointKind::PaneScroll { .. }
+                 | PendingEndpointKind::WordSelection { .. }
+                 | PendingEndpointKind::PaneLinkActivate { .. }
++                | PendingEndpointKind::LensPrefix { .. }
++                | PendingEndpointKind::LensSuffix { .. }
+                 | PendingEndpointKind::PaneLinkResolve { .. }
+                 | PendingEndpointKind::CopyMotion { .. }
+                 | PendingEndpointKind::CopySearch { .. },
+diff --git a/src/client/shell/lens.rs b/src/client/shell/lens.rs
+new file mode 100644
+index 0000000..67c2aca
+--- /dev/null
++++ b/src/client/shell/lens.rs
+@@ -0,0 +1,545 @@
++//! Local Lens integration using existing, revision-checked public endpoint methods.
++//! No server replacement or wire-format changes are needed.
++use super::*;
++use crate::api::schema::{PaneSelectionReadParams, PaneTextPoint, PluginInvocationContext};
++use unicode_segmentation::UnicodeSegmentation;
++
++#[derive(Debug, Clone)]
++pub(super) struct LensClick {
++    context: PluginInvocationContext,
++    pane_id: String,
++    row: u32,
++    col: u16,
++    end_row: u32,
++    end_col: u16,
++    revision: u64,
++    generation: u64,
++}
++
++impl ClientShellState {
++    pub(super) fn capture_lens_click(
++        &mut self,
++        hit: &PaneHit,
++        viewport_row: u16,
++        col: u16,
++    ) -> Option<Box<LensClick>> {
++        tracing::debug!(
++            enabled = self.lens_enabled,
++            viewport_row,
++            col,
++            "Lens click capture"
++        );
++        if !self.lens_enabled {
++            return None;
++        }
++        self.lens_generation = self.lens_generation.wrapping_add(1);
++        let snapshot = self.snapshot.as_deref()?;
++        let surface = self.pane_surface.as_ref()?;
++        if surface.boot_id != snapshot.boot_id || surface.projection_revision != snapshot.revision {
++            tracing::debug!("Lens click ignored: projection changed");
++            return None;
++        }
++        let pane = snapshot
++            .panes
++            .iter()
++            .find(|pane| pane.pane_id == hit.pane_id)?;
++        let projected = surface
++            .panes
++            .iter()
++            .find(|pane| pane.pane_id == hit.pane_id)?;
++        let cwd = pane.foreground_cwd.clone().or_else(|| pane.cwd.clone())?;
++        let row = crate::selection::absolute_row_for_viewport(viewport_row, hit.scroll);
++        // Ghostty rejects selections ending in never-written padding rows.
++        // Bound the suffix at the last rendered nonblank cell, using the
++        // source surface (not the sidebar-adjusted composed coordinates).
++        let rect = projected.inner_rect;
++        let mut last = (viewport_row, col);
++        for r in viewport_row
++            ..=viewport_row
++                .saturating_add(8)
++                .min(rect.height.saturating_sub(1))
++        {
++            for c in (if r == viewport_row { col } else { 0 })..rect.width {
++                let x = usize::from(rect.x) + usize::from(c);
++                let y = usize::from(rect.y) + usize::from(r);
++                if x >= usize::from(surface.frame.width) || y >= usize::from(surface.frame.height) {
++                    continue;
++                }
++                if surface
++                    .frame
++                    .cells
++                    .get(y * usize::from(surface.frame.width) + x)
++                    .is_some_and(|cell| !cell.symbol.trim().is_empty())
++                {
++                    last = (r, c);
++                }
++            }
++        }
++        let end_row = crate::selection::absolute_row_for_viewport(last.0, hit.scroll);
++        let context = PluginInvocationContext {
++            workspace_id: Some(pane.workspace_id.clone()),
++            workspace_label: None,
++            workspace_cwd: Some(cwd.clone()),
++            worktree: None,
++            tab_id: Some(pane.tab_id.clone()),
++            tab_label: None,
++            focused_pane_id: Some(pane.pane_id.clone()),
++            focused_pane_cwd: Some(cwd),
++            focused_pane_agent: None,
++            focused_pane_status: None,
++            selected_text: None,
++            invocation_source: Some("lens_ctrl_click".into()),
++            correlation_id: None,
++            clicked_url: None,
++            link_handler_id: None,
++        };
++        Some(Box::new(LensClick {
++            context,
++            pane_id: pane.pane_id.clone(),
++            row,
++            col,
++            end_row,
++            end_col: last.1,
++            revision: projected.content_revision,
++            generation: self.lens_generation,
++        }))
++    }
++
++    pub(super) fn request_lens_prefix(&mut self, click: Box<LensClick>) -> Vec<ClientShellAction> {
++        tracing::debug!(
++            row = click.row,
++            col = click.col,
++            end_row = click.end_row,
++            end_col = click.end_col,
++            revision = click.revision,
++            "Lens prefix request"
++        );
++        if click.generation != self.lens_generation {
++            return Vec::new();
++        }
++        let mut outcome = ClientShellInput::default();
++        self.push_endpoint_method_with_kind(
++            crate::api::schema::Method::PaneSelectionRead(PaneSelectionReadParams {
++                pane_id: click.pane_id.clone(),
++                anchor: PaneTextPoint {
++                    row: click.row.saturating_sub(8),
++                    col: 0,
++                },
++                cursor: PaneTextPoint {
++                    row: click.row,
++                    col: click.col,
++                },
++                content_revision: Some(click.revision),
++            }),
++            PendingEndpointKind::LensPrefix { click },
++            &mut outcome,
++        );
++        outcome.actions
++    }
++
++    pub(super) fn complete_lens_prefix(
++        &mut self,
++        click: Box<LensClick>,
++        prefix: String,
++    ) -> Vec<ClientShellAction> {
++        tracing::debug!(bytes = prefix.len(), "Lens prefix received");
++        if click.generation != self.lens_generation {
++            return Vec::new();
++        }
++        let mut outcome = ClientShellInput::default();
++        self.push_endpoint_method_with_kind(
++            crate::api::schema::Method::PaneSelectionRead(PaneSelectionReadParams {
++                pane_id: click.pane_id.clone(),
++                anchor: PaneTextPoint {
++                    row: click.row,
++                    col: click.col,
++                },
++                cursor: PaneTextPoint {
++                    row: click.end_row,
++                    col: click.end_col,
++                },
++                content_revision: Some(click.revision),
++            }),
++            PendingEndpointKind::LensSuffix { click, prefix },
++            &mut outcome,
++        );
++        outcome.actions
++    }
++
++    pub(super) fn complete_lens_suffix(
++        &mut self,
++        click: Box<LensClick>,
++        prefix: String,
++        suffix: String,
++    ) -> Vec<ClientShellAction> {
++        tracing::debug!(
++            prefix_bytes = prefix.len(),
++            suffix_bytes = suffix.len(),
++            "Lens suffix received"
++        );
++        if click.generation != self.lens_generation {
++            return Vec::new();
++        }
++        let Some((offset, _)) = prefix.grapheme_indices(true).next_back() else {
++            return Vec::new();
++        };
++        let text = format!("{}{}", &prefix[..offset], suffix);
++        let Some(path) = path_at_byte(&text, offset) else {
++            tracing::debug!("Lens click is not a file reference");
++            return Vec::new();
++        };
++        // The stable TUI endpoint exposes command.invoke, not the unrestricted
++        // plugin.action.invoke socket API. Resolve its opaque advertised command
++        // and send a revision-checked selection on the original pane.
++        let command_id = self.snapshot.as_deref().and_then(|snapshot| {
++            snapshot
++                .commands
++                .iter()
++                .find(|command| {
++                    command.action == crate::protocol::ClientShellCommandAction::PluginAction
++                        && command.description.as_deref() == Some("Lens: preview file")
++                })
++                .map(|command| command.command_id.clone())
++        });
++        let Some(command_id) = command_id else {
++            self.set_endpoint_error(
++                "Lens shortcut is not installed on this machine; install Lens and reload config.",
++            );
++            return Vec::new();
++        };
++        let Some(selection) = self.lens_path_selection(&click, &path) else {
++            self.set_endpoint_error("File reference changed or is outside the viewport; select its full path and use Lens.");
++            return Vec::new();
++        };
++        let mut outcome = ClientShellInput::default();
++        self.push_endpoint_method(
++            crate::api::schema::Method::CommandInvoke(crate::api::schema::CommandInvokeParams {
++                command_id,
++                workspace_id: click.context.workspace_id,
++                tab_id: click.context.tab_id,
++                pane_id: Some(click.pane_id),
++                selection: Some(selection),
++            }),
++            &mut outcome,
++        );
++        outcome.actions
++    }
++
++    fn lens_path_selection(
++        &self,
++        click: &LensClick,
++        path: &str,
++    ) -> Option<PaneSelectionReadParams> {
++        let surface = self.pane_surface.as_ref()?;
++        let pane = surface.panes.iter().find(|pane| {
++            pane.pane_id == click.pane_id && pane.content_revision == click.revision
++        })?;
++        let hit = self
++            .hits
++            .panes
++            .iter()
++            .find(|hit| hit.pane_id == click.pane_id)?;
++        let rect = pane.inner_rect;
++        let mut text = String::new();
++        let mut cells = Vec::new();
++        for r in 0..rect.height {
++            let mut covered_until = 0;
++            for c in 0..rect.width {
++                if c < covered_until {
++                    continue;
++                }
++                let x = usize::from(rect.x) + usize::from(c);
++                let y = usize::from(rect.y) + usize::from(r);
++                if x >= usize::from(surface.frame.width) || y >= usize::from(surface.frame.height) {
++                    continue;
++                }
++                let cell = surface
++                    .frame
++                    .cells
++                    .get(y * usize::from(surface.frame.width) + x)?;
++                if cell.skip || cell.symbol.is_empty() {
++                    continue;
++                }
++                covered_until = c.saturating_add(cell.symbol.width().max(1) as u16);
++                let start = text.len();
++                text.push_str(&cell.symbol);
++                cells.push((
++                    start..text.len(),
++                    crate::selection::absolute_row_for_viewport(r, hit.scroll),
++                    c,
++                ));
++            }
++        }
++        let mut matches = Vec::new();
++        for (start, _) in text.match_indices(path) {
++            let end = start + path.len() - 1;
++            let a = cells.iter().find(|(range, _, _)| range.contains(&start))?;
++            let b = cells.iter().find(|(range, _, _)| range.contains(&end))?;
++            let selection = PaneSelectionReadParams {
++                pane_id: click.pane_id.clone(),
++                anchor: PaneTextPoint { row: a.1, col: a.2 },
++                cursor: PaneTextPoint { row: b.1, col: b.2 },
++                content_revision: Some(click.revision),
++            };
++            if (a.1, a.2) <= (click.row, click.col) && (click.row, click.col) <= (b.1, b.2) {
++                return Some(selection);
++            }
++            if a.1 >= click.row.saturating_sub(8) && b.1 <= click.end_row {
++                matches.push(selection);
++            }
++        }
++        if matches.len() == 1 {
++            matches.pop()
++        } else {
++            None
++        }
++    }
++}
++
++fn looks_like_path(path: &str) -> bool {
++    if path.starts_with("file://") {
++        return true;
++    }
++    if path.contains("://") || path.starts_with('#') || path.starts_with('-') {
++        return false;
++    }
++    if path.starts_with('/')
++        || path.starts_with("~/")
++        || path.starts_with("./")
++        || path.starts_with("../")
++    {
++        return path.len() > 1;
++    }
++    if path.contains('/') {
++        return !path.ends_with(':');
++    }
++    let without_line = path.split(':').next().unwrap_or(path);
++    if matches!(
++        without_line,
++        "README" | "LICENSE" | "Makefile" | "Dockerfile" | "AGENTS.md"
++    ) {
++        return true;
++    }
++    without_line.rsplit_once('.').is_some_and(|(stem, ext)| {
++        !stem.is_empty()
++            && !ext.is_empty()
++            && ext.len() <= 12
++            && ext.chars().all(|c| c.is_ascii_alphanumeric())
++            && ext.chars().any(|c| c.is_ascii_alphabetic())
++    })
++}
++
++pub(super) fn path_at_byte(text: &str, clicked: usize) -> Option<String> {
++    // Explicit quoting and Markdown destinations can contain spaces.
++    for pattern in [
++        r"\[[^\]\n]+\]\(([^)\n]+)\)",
++        r#""([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`"#,
++    ] {
++        let regex = regex::Regex::new(pattern).ok()?;
++        for capture in regex.captures_iter(text) {
++            let whole = capture.get(0)?;
++            if whole.start() <= clicked && clicked < whole.end() {
++                let path = capture.iter().skip(1).flatten().next()?.as_str();
++                if looks_like_path(path) {
++                    return Some(path.to_owned());
++                }
++            }
++        }
++    }
++    let regex = regex::Regex::new(r#"[^\s<>"'`]+"#).ok()?;
++    for found in regex.find_iter(text) {
++        let token = found.as_str();
++        let leading = token.len() - token.trim_start_matches(['[', '(', '{']).len();
++        let mut path = &token[leading..];
++        path = path.trim_end_matches(['.', ',', ';', '!', '?', '。', '，', '；']);
++        while path.ends_with(')') && path.matches(')').count() > path.matches('(').count()
++            || path.ends_with(']') && path.matches(']').count() > path.matches('[').count()
++            || path.ends_with('}') && path.matches('}').count() > path.matches('{').count()
++        {
++            path = &path[..path.len() - 1];
++        }
++        path = path.trim_end_matches('.');
++        let start = found.start() + leading;
++        if start <= clicked && clicked < start + path.len() && looks_like_path(path) {
++            return Some(path.to_owned());
++        }
++    }
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::client::shell::tests::{snapshot, surface};
++
++    fn ready() -> (ClientShellState, Box<LensClick>) {
++        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++        state.lens_enabled = true;
++        let mut snapshot = snapshot();
++        snapshot.commands.push(crate::protocol::ClientShellCommand {
++            command_id: "test-lens-command".into(),
++            binding_label: "Ctrl+b, f".into(),
++            binding_labels: vec!["Ctrl+b, f".into()],
++            action: crate::protocol::ClientShellCommandAction::PluginAction,
++            description: Some("Lens: preview file".into()),
++        });
++        state.set_snapshot(Box::new(snapshot));
++        let mut projected = surface();
++        let buffer = Buffer::with_lines(["Done:", "src/report.rs:42:8", ""]);
++        projected.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
++        projected.panes[0].inner_rect.width = buffer.area.width;
++        projected.panes[0].inner_rect.height = buffer.area.height;
++        projected.panes[0].rect = projected.panes[0].inner_rect;
++        state.set_pane_surface(projected);
++        state.compose(106, 20).expect("frame");
++        let hit = state.hits.panes[0].clone();
++        let click = state.capture_lens_click(&hit, 1, 3).expect("click");
++        (state, click)
++    }
++
++    #[test]
++    fn lens_click_preserves_source_and_revision_and_drops_old_requests() {
++        let (mut state, click) = ready();
++        let actions = state.request_lens_prefix(click.clone());
++        let [ClientShellAction::Endpoint { request, .. }] = &actions[..] else {
++            panic!("expected read");
++        };
++        assert!(matches!(&request.method,
++            crate::api::schema::Method::PaneSelectionRead(params)
++                if params.pane_id == "pane_1" && params.content_revision == Some(click.revision)));
++        let actions = state.complete_lens_suffix(
++            click.clone(),
++            "Done: src/r".into(),
++            "report.rs:42:8".into(),
++        );
++        let [ClientShellAction::Endpoint { request, .. }] = &actions[..] else {
++            panic!("expected plugin action");
++        };
++        let crate::api::schema::Method::CommandInvoke(params) = &request.method else {
++            panic!("expected Lens action");
++        };
++        assert_eq!(params.command_id, "test-lens-command");
++        assert_eq!(params.pane_id.as_deref(), Some("pane_1"));
++        assert_eq!(params.workspace_id.as_deref(), Some("ws_1"));
++        assert_eq!(
++            params.selection.as_ref().expect("selection").anchor,
++            PaneTextPoint { row: 1, col: 0 }
++        );
++        assert_eq!(
++            params.selection.as_ref().expect("selection").cursor,
++            PaneTextPoint {
++                row: 1,
++                col: "src/report.rs:42:8".len() as u16 - 1
++            }
++        );
++        state.lens_generation += 1;
++        assert!(state
++            .complete_lens_suffix(click, "old.md".into(), "d".into())
++            .is_empty());
++    }
++
++    #[test]
++    fn lens_stale_terminal_read_and_old_machine_reply_never_open_files() {
++        let (mut state, click) = ready();
++        let actions = state.request_lens_prefix(click.clone());
++        let [ClientShellAction::Endpoint { request, .. }] = &actions[..] else {
++            panic!("read");
++        };
++        let (_, actions) = state.handle_endpoint_result(
++            "boot-1",
++            &request.id,
++            Err(ClientShellEndpointError {
++                code: Some("stale_content".into()),
++                message: "changed".into(),
++            }),
++        );
++        assert!(actions.is_empty());
++        let actions = state.request_lens_prefix(click);
++        let [ClientShellAction::Endpoint { request, .. }] = &actions[..] else {
++            panic!("read");
++        };
++        let mut other = snapshot();
++        other.boot_id = "other-machine".into();
++        state.set_snapshot(Box::new(other));
++        let (_, actions) = state.handle_endpoint_result(
++            "boot-1",
++            &request.id,
++            Ok(crate::api::schema::ResponseResult::PaneSelection {
++                pane_id: "pane_1".into(),
++                text: "/old/file.md".into(),
++            }),
++        );
++        assert!(actions.is_empty());
++    }
++
++    #[test]
++    fn lens_suffix_stops_before_unwritten_terminal_padding() {
++        let (mut state, _) = ready();
++        let mut projected = surface();
++        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 12));
++        buffer.set_string(0, 0, "reports/readme.md", Style::default());
++        projected.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
++        projected.panes[0].inner_rect.width = 30;
++        projected.panes[0].inner_rect.height = 12;
++        projected.panes[0].rect = projected.panes[0].inner_rect;
++        state.set_pane_surface(projected);
++        state.compose(106, 20).expect("frame");
++        let hit = state.hits.panes[0].clone();
++        let click = state.capture_lens_click(&hit, 0, 3).expect("click");
++        assert_eq!(click.end_row, 0);
++        assert_eq!(click.end_col, "reports/readme.md".len() as u16 - 1);
++    }
++
++    #[test]
++    fn lens_selection_maps_wide_characters_across_rows_without_padding_spaces() {
++        let (mut state, _) = ready();
++        let mut projected = surface();
++        let buffer = Buffer::with_lines(["/tmp/报", "告.md"]);
++        projected.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
++        projected.panes[0].inner_rect.width = buffer.area.width;
++        projected.panes[0].inner_rect.height = buffer.area.height;
++        projected.panes[0].rect = projected.panes[0].inner_rect;
++        state.set_pane_surface(projected);
++        state.compose(106, 20).expect("frame");
++        let hit = state.hits.panes[0].clone();
++        let click = state.capture_lens_click(&hit, 1, 1).expect("click");
++        let selection = state
++            .lens_path_selection(&click, "/tmp/报告.md")
++            .expect("wide path");
++        assert_eq!(selection.anchor, PaneTextPoint { row: 0, col: 0 });
++        assert_eq!(selection.cursor, PaneTextPoint { row: 1, col: 4 });
++    }
++
++    #[test]
++    fn lens_paths_accept_agent_output_unicode_and_line_numbers() {
++        for (text, needle, expected) in [
++            ("Done: src/report.ts:42:8.", "report", "src/report.ts:42:8"),
++            ("已生成 `报告/构建 总结.md`", "总结", "报告/构建 总结.md"),
++            ("Read \"/tmp/a b#c.md\"", "b#", "/tmp/a b#c.md"),
++            ("[报告](reports/summary.md)", "报告", "reports/summary.md"),
++            ("See (/tmp/a(b).md).", "a(b)", "/tmp/a(b).md"),
++            ("file:///tmp/a%20b.md#L2", "%20", "file:///tmp/a%20b.md#L2"),
++            ("README.md", "README", "README.md"),
++        ] {
++            assert_eq!(
++                path_at_byte(text, text.find(needle).expect("needle")).as_deref(),
++                Some(expected),
++                "{text}"
++            );
++        }
++    }
++
++    #[test]
++    fn lens_paths_do_not_claim_web_urls_or_plain_prose() {
++        for text in [
++            "https://example.org/report.md",
++            "hello",
++            "3.14159",
++            "#heading",
++            "--help",
++        ] {
++            assert!(path_at_byte(text, 1).is_none(), "{text}");
++        }
++        assert!(path_at_byte("file.md other.txt", 7).is_none());
++    }
++}
